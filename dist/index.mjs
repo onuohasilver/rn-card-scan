@@ -1,13 +1,7 @@
-var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
-  get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
-}) : x)(function(x) {
-  if (typeof require !== "undefined") return require.apply(this, arguments);
-  throw Error('Dynamic require of "' + x + '" is not supported');
-});
-
 // src/components/CardScannerView.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Platform as Platform2, SafeAreaView, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView, StyleSheet, Text, View } from "react-native";
+import { Camera, useCameraDevice, useCameraPermission } from "react-native-vision-camera";
 
 // src/pipeline/options.ts
 var ALL_BRANDS = ["visa", "mastercard", "amex", "discover", "other"];
@@ -432,8 +426,10 @@ function clamp(value) {
 
 // src/components/CardScannerView.tsx
 var FOCUS_SETTLE_MS = 900;
-function resolveCameraModule() {
-  return __require("expo-camera");
+async function takePhotoUri(camera) {
+  const photo = await camera.takePhoto({ enableShutterSound: false });
+  const path = photo.path;
+  return { uri: path.startsWith("file://") ? path : `file://${path}` };
 }
 function CardScannerView({
   options,
@@ -449,10 +445,8 @@ function CardScannerView({
   const cameraReadyAtRef = useRef(null);
   const focusReadyRef = useRef(false);
   const focusTimerRef = useRef(null);
-  const cameraModule = resolveCameraModule();
-  const CameraView = cameraModule.CameraView;
-  const useCameraPermissions = cameraModule.useCameraPermissions ?? (() => [{ granted: false }, async () => Promise.resolve()]);
-  const [permission, requestPermission] = useCameraPermissions();
+  const device = useCameraDevice("back");
+  const { hasPermission, requestPermission } = useCameraPermission();
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [focusReady, setFocusReady] = useState(false);
@@ -486,11 +480,7 @@ function CardScannerView({
         isCapturingRef.current = true;
         try {
           await waitForCameraStability(cameraReadyRef, cameraReadyAtRef, focusReadyRef);
-          return await cameraRef.current.takePictureAsync({
-            quality: 1,
-            skipProcessing: false,
-            shutterSound: false
-          });
+          return await takePhotoUri(cameraRef.current);
         } finally {
           isCapturingRef.current = false;
         }
@@ -505,11 +495,7 @@ function CardScannerView({
             if (!cameraRef.current) {
               break;
             }
-            const frame = await cameraRef.current.takePictureAsync({
-              quality: 1,
-              skipProcessing: false,
-              shutterSound: false
-            });
+            const frame = await takePhotoUri(cameraRef.current);
             frames.push(frame);
             await sleep(220);
           }
@@ -530,7 +516,7 @@ function CardScannerView({
       clearTimeout(focusTimerRef.current);
       focusTimerRef.current = null;
     }
-    if (!permission?.granted) {
+    if (!hasPermission) {
       cameraReadyRef.current = false;
       cameraReadyAtRef.current = null;
       focusReadyRef.current = false;
@@ -546,7 +532,7 @@ function CardScannerView({
     setFrameState("searching");
     const timer = setTimeout(() => setFrameState("ready"), 450);
     return () => clearTimeout(timer);
-  }, [cameraReady, focusReady, permission?.granted]);
+  }, [cameraReady, focusReady, hasPermission]);
   useEffect(() => {
     if (!cameraReady) {
       focusReadyRef.current = false;
@@ -581,11 +567,7 @@ function CardScannerView({
           continue;
         }
         try {
-          const photo = await cameraRef.current.takePictureAsync({
-            quality: 0.25,
-            skipProcessing: true,
-            shutterSound: false
-          });
+          const photo = await takePhotoUri(cameraRef.current);
           if (cancelled || detectionFiredRef.current || isCapturingRef.current) break;
           const frame = await recognizeCardFrame(photo.uri);
           const parsed = extractCardCandidates(frame.lines);
@@ -615,10 +597,11 @@ function CardScannerView({
   const TextComponent = Text;
   const ViewComponent = View;
   const SafeAreaComponent = SafeAreaView;
-  if (!CameraView) {
-    return React.createElement(TextComponent, { style: styles.error }, "`expo-camera` is not installed in host app.");
+  const CameraComponent = Camera;
+  if (!device) {
+    return React.createElement(TextComponent, { style: styles.error }, "No back camera device available on this device.");
   }
-  if (!permission?.granted) {
+  if (!hasPermission) {
     return React.createElement(
       ViewComponent,
       { style: [styles.permissionWrap, normalized.uiMode === "fullscreen" ? styles.fullscreenRoot : styles.embeddedRoot] },
@@ -644,22 +627,19 @@ function CardScannerView({
   return React.createElement(
     ViewComponent,
     { style: normalized.uiMode === "fullscreen" ? styles.fullscreenRoot : styles.embeddedRoot },
-    React.createElement(CameraView, {
+    React.createElement(CameraComponent, {
       ref: cameraRef,
       style: styles.camera,
-      facing: "back",
-      mode: "picture",
-      autofocus: "on",
-      animateShutter: false,
-      enableTorch: torchEnabled,
-      responsiveOrientationWhenOrientationLocked: true,
-      pictureSize: Platform2.OS === "ios" ? "High" : void 0,
-      onCameraReady: () => {
+      device,
+      isActive: true,
+      photo: true,
+      torch: torchEnabled ? "on" : "off",
+      onInitialized: () => {
         cameraReadyRef.current = true;
         cameraReadyAtRef.current = Date.now();
         setCameraReady(true);
       },
-      onMountError: () => {
+      onError: () => {
         cameraReadyRef.current = false;
         cameraReadyAtRef.current = null;
         focusReadyRef.current = false;

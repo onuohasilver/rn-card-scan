@@ -17,7 +17,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --external expo-camera --external react --external react-native",
+    "build": "tsup src/index.ts --format esm,cjs --dts --external react-native-vision-camera --external react --external react-native",
     "prepare": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -25,12 +25,14 @@
   },
   "peerDependencies": {
     "react": ">=18.0.0",
-    "react-native": ">=0.73.0"
+    "react-native": ">=0.73.0",
+    "react-native-vision-camera": ">=4.0.0"
   },
   "devDependencies": {
     "@types/react": "~19.1.10",
     "react": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-vision-camera": "4.6.4",
     "tsup": "^8.3.5",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"
