@@ -16,28 +16,27 @@ export interface CardScannerViewProps {
 }
 
 type CameraRefLike = {
-  takePictureAsync: (options?: Record<string, unknown>) => Promise<{ uri: string }>;
-};
-
-type PermissionState = {
-  granted?: boolean;
+  takePhoto: (options?: Record<string, unknown>) => Promise<{ path: string }>;
 };
 
 type FrameState = 'searching' | 'ready' | 'needs_help';
 const FOCUS_SETTLE_MS = 900;
 
-function resolveCameraModule(): {
-  CameraView?: React.ComponentType<Record<string, unknown> & { ref?: React.Ref<CameraRefLike> }>;
-  useCameraPermissions?: () => [PermissionState | null, () => Promise<unknown>];
-} {
-  // expo-camera is an OPTIONAL peer dependency. Hosts that ship a different
-  // camera stack (e.g. react-native-vision-camera) will not have it installed;
-  // returning an empty module lets the SDK load without crashing the bundler.
-  // The CardScannerView component then renders a placeholder until the host
-  // wires in its own camera adapter.
+type VisionCameraModule = {
+  Camera?: React.ComponentType<Record<string, unknown> & { ref?: React.Ref<CameraRefLike> }>;
+  useCameraDevice?: (position: 'back' | 'front') => unknown;
+  useCameraPermission?: () => { hasPermission: boolean; requestPermission: () => Promise<boolean> };
+};
+
+function resolveCameraModule(): VisionCameraModule {
+  // react-native-vision-camera is an OPTIONAL peer dependency. Hosts that ship
+  // a different camera stack (or have not yet installed it) can still load the
+  // SDK; CardScannerView will render a placeholder until vision-camera is
+  // available. The string concatenation also keeps Metro from statically
+  // resolving the module at bundle time in hosts that lack it.
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require('expo' + '-camera');
+    return require('react-native' + '-vision-camera');
   } catch {
     return {};
   }
@@ -58,12 +57,18 @@ export function CardScannerView({
   const focusReadyRef = useRef(false);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraModule = resolveCameraModule();
-  const CameraView = cameraModule.CameraView;
-  const useCameraPermissions =
-    cameraModule.useCameraPermissions ??
-    (() => [{ granted: false } as PermissionState, async () => Promise.resolve()]);
+  const Camera = cameraModule.Camera;
+  const useCameraDevice =
+    cameraModule.useCameraDevice ?? ((_position: 'back' | 'front') => null);
+  const useCameraPermission =
+    cameraModule.useCameraPermission ??
+    (() => ({
+      hasPermission: false,
+      requestPermission: async () => false,
+    }));
 
-  const [permission, requestPermission] = useCameraPermissions();
+  const device = useCameraDevice('back');
+  const { hasPermission, requestPermission } = useCameraPermission();
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [focusReady, setFocusReady] = useState(false);
@@ -87,6 +92,12 @@ export function CardScannerView({
     return base;
   }, [options, fullscreen]);
 
+  // Vision-camera returns `path` (filesystem path); the OCR pipeline expects a
+  // URI. Normalize once here so callers further down stay platform-agnostic.
+  const photoToFrame = (photo: { path: string }): { uri: string } => ({
+    uri: photo.path.startsWith('file://') ? photo.path : `file://${photo.path}`,
+  });
+
   useEffect(() => {
     cameraReadyRef.current = false;
     cameraReadyAtRef.current = null;
@@ -102,11 +113,12 @@ export function CardScannerView({
         isCapturingRef.current = true;
         try {
           await waitForCameraStability(cameraReadyRef, cameraReadyAtRef, focusReadyRef);
-          return await cameraRef.current.takePictureAsync({
-            quality: 1,
-            skipProcessing: false,
-            shutterSound: false,
+          const photo = await cameraRef.current.takePhoto({
+            flash: 'off',
+            enableShutterSound: false,
+            qualityPrioritization: 'quality',
           });
+          return photoToFrame(photo);
         } finally {
           isCapturingRef.current = false;
         }
@@ -122,12 +134,12 @@ export function CardScannerView({
               break;
             }
 
-            const frame = await cameraRef.current.takePictureAsync({
-              quality: 1,
-              skipProcessing: false,
-              shutterSound: false,
+            const photo = await cameraRef.current.takePhoto({
+              flash: 'off',
+              enableShutterSound: false,
+              qualityPrioritization: 'quality',
             });
-            frames.push(frame);
+            frames.push(photoToFrame(photo));
             await sleep(220);
           }
         } finally {
@@ -152,7 +164,7 @@ export function CardScannerView({
       focusTimerRef.current = null;
     }
 
-    if (!permission?.granted) {
+    if (!hasPermission) {
       cameraReadyRef.current = false;
       cameraReadyAtRef.current = null;
       focusReadyRef.current = false;
@@ -170,7 +182,7 @@ export function CardScannerView({
     setFrameState('searching');
     const timer = setTimeout(() => setFrameState('ready'), 450);
     return () => clearTimeout(timer);
-  }, [cameraReady, focusReady, permission?.granted]);
+  }, [cameraReady, focusReady, hasPermission]);
 
   useEffect(() => {
     if (!cameraReady) {
@@ -197,7 +209,7 @@ export function CardScannerView({
   }, [cameraReady, torchEnabled, onCameraReady]);
 
   // Auto-detection loop: polls camera at low quality, fires onCardDetected when
-  // a PAN is found in two consecutive frames.
+  // a PAN is found in three consecutive frames.
   useEffect(() => {
     if (!focusReady || !onCardDetectedRef.current) return;
 
@@ -216,14 +228,14 @@ export function CardScannerView({
         }
 
         try {
-          const photo = await cameraRef.current.takePictureAsync({
-            quality: 0.25,
-            skipProcessing: true,
-            shutterSound: false,
+          const photo = await cameraRef.current.takePhoto({
+            flash: 'off',
+            enableShutterSound: false,
+            qualityPrioritization: 'speed',
           });
           if (cancelled || detectionFiredRef.current || isCapturingRef.current) break;
 
-          const frame = await recognizeCardFrame(photo.uri);
+          const frame = await recognizeCardFrame(photoToFrame(photo).uri);
           const parsed = extractCardCandidates(frame.lines);
 
           if (parsed.panCandidate) {
@@ -255,11 +267,23 @@ export function CardScannerView({
   const ViewComponent = View as unknown as React.ComponentType<Record<string, unknown>>;
   const SafeAreaComponent = SafeAreaView as unknown as React.ComponentType<Record<string, unknown>>;
 
-  if (!CameraView) {
-    return React.createElement(TextComponent, { style: styles.error }, '`expo-camera` is not installed in host app.');
+  if (!Camera) {
+    return React.createElement(TextComponent, { style: styles.error }, '`react-native-vision-camera` is not installed in host app.');
   }
 
-  if (!permission?.granted) {
+  if (!device) {
+    return React.createElement(
+      ViewComponent,
+      { style: [styles.permissionWrap, normalized.uiMode === 'fullscreen' ? styles.fullscreenRoot : styles.embeddedRoot] },
+      React.createElement(
+        TextComponent,
+        { style: styles.permissionText },
+        'No back camera available on this device.'
+      )
+    );
+  }
+
+  if (!hasPermission) {
     return React.createElement(
       ViewComponent,
       { style: [styles.permissionWrap, normalized.uiMode === 'fullscreen' ? styles.fullscreenRoot : styles.embeddedRoot] },
@@ -296,22 +320,20 @@ export function CardScannerView({
   return React.createElement(
     ViewComponent,
     { style: normalized.uiMode === 'fullscreen' ? styles.fullscreenRoot : styles.embeddedRoot },
-    React.createElement(CameraView, {
+    React.createElement(Camera, {
       ref: cameraRef,
       style: styles.camera,
-      facing: 'back',
-      mode: 'picture',
-      autofocus: 'on',
-      animateShutter: false,
-      enableTorch: torchEnabled,
-      responsiveOrientationWhenOrientationLocked: true,
-      pictureSize: Platform.OS === 'ios' ? 'High' : undefined,
-      onCameraReady: () => {
+      device,
+      isActive: true,
+      photo: true,
+      torch: torchEnabled ? 'on' : 'off',
+      photoQualityBalance: Platform.OS === 'ios' ? 'quality' : undefined,
+      onInitialized: () => {
         cameraReadyRef.current = true;
         cameraReadyAtRef.current = Date.now();
         setCameraReady(true);
       },
-      onMountError: () => {
+      onError: () => {
         cameraReadyRef.current = false;
         cameraReadyAtRef.current = null;
         focusReadyRef.current = false;

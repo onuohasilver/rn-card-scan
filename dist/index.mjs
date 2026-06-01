@@ -434,7 +434,7 @@ function clamp(value) {
 var FOCUS_SETTLE_MS = 900;
 function resolveCameraModule() {
   try {
-    return __require("expo-camera");
+    return __require("react-native-vision-camera");
   } catch {
     return {};
   }
@@ -454,9 +454,14 @@ function CardScannerView({
   const focusReadyRef = useRef(false);
   const focusTimerRef = useRef(null);
   const cameraModule = resolveCameraModule();
-  const CameraView = cameraModule.CameraView;
-  const useCameraPermissions = cameraModule.useCameraPermissions ?? (() => [{ granted: false }, async () => Promise.resolve()]);
-  const [permission, requestPermission] = useCameraPermissions();
+  const Camera = cameraModule.Camera;
+  const useCameraDevice = cameraModule.useCameraDevice ?? ((_position) => null);
+  const useCameraPermission = cameraModule.useCameraPermission ?? (() => ({
+    hasPermission: false,
+    requestPermission: async () => false
+  }));
+  const device = useCameraDevice("back");
+  const { hasPermission, requestPermission } = useCameraPermission();
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [focusReady, setFocusReady] = useState(false);
@@ -476,6 +481,9 @@ function CardScannerView({
     }
     return base;
   }, [options, fullscreen]);
+  const photoToFrame = (photo) => ({
+    uri: photo.path.startsWith("file://") ? photo.path : `file://${photo.path}`
+  });
   useEffect(() => {
     cameraReadyRef.current = false;
     cameraReadyAtRef.current = null;
@@ -490,11 +498,12 @@ function CardScannerView({
         isCapturingRef.current = true;
         try {
           await waitForCameraStability(cameraReadyRef, cameraReadyAtRef, focusReadyRef);
-          return await cameraRef.current.takePictureAsync({
-            quality: 1,
-            skipProcessing: false,
-            shutterSound: false
+          const photo = await cameraRef.current.takePhoto({
+            flash: "off",
+            enableShutterSound: false,
+            qualityPrioritization: "quality"
           });
+          return photoToFrame(photo);
         } finally {
           isCapturingRef.current = false;
         }
@@ -509,12 +518,12 @@ function CardScannerView({
             if (!cameraRef.current) {
               break;
             }
-            const frame = await cameraRef.current.takePictureAsync({
-              quality: 1,
-              skipProcessing: false,
-              shutterSound: false
+            const photo = await cameraRef.current.takePhoto({
+              flash: "off",
+              enableShutterSound: false,
+              qualityPrioritization: "quality"
             });
-            frames.push(frame);
+            frames.push(photoToFrame(photo));
             await sleep(220);
           }
         } finally {
@@ -534,7 +543,7 @@ function CardScannerView({
       clearTimeout(focusTimerRef.current);
       focusTimerRef.current = null;
     }
-    if (!permission?.granted) {
+    if (!hasPermission) {
       cameraReadyRef.current = false;
       cameraReadyAtRef.current = null;
       focusReadyRef.current = false;
@@ -550,7 +559,7 @@ function CardScannerView({
     setFrameState("searching");
     const timer = setTimeout(() => setFrameState("ready"), 450);
     return () => clearTimeout(timer);
-  }, [cameraReady, focusReady, permission?.granted]);
+  }, [cameraReady, focusReady, hasPermission]);
   useEffect(() => {
     if (!cameraReady) {
       focusReadyRef.current = false;
@@ -585,13 +594,13 @@ function CardScannerView({
           continue;
         }
         try {
-          const photo = await cameraRef.current.takePictureAsync({
-            quality: 0.25,
-            skipProcessing: true,
-            shutterSound: false
+          const photo = await cameraRef.current.takePhoto({
+            flash: "off",
+            enableShutterSound: false,
+            qualityPrioritization: "speed"
           });
           if (cancelled || detectionFiredRef.current || isCapturingRef.current) break;
-          const frame = await recognizeCardFrame(photo.uri);
+          const frame = await recognizeCardFrame(photoToFrame(photo).uri);
           const parsed = extractCardCandidates(frame.lines);
           if (parsed.panCandidate) {
             consecutiveHitsRef.current += 1;
@@ -619,10 +628,21 @@ function CardScannerView({
   const TextComponent = Text;
   const ViewComponent = View;
   const SafeAreaComponent = SafeAreaView;
-  if (!CameraView) {
-    return React.createElement(TextComponent, { style: styles.error }, "`expo-camera` is not installed in host app.");
+  if (!Camera) {
+    return React.createElement(TextComponent, { style: styles.error }, "`react-native-vision-camera` is not installed in host app.");
   }
-  if (!permission?.granted) {
+  if (!device) {
+    return React.createElement(
+      ViewComponent,
+      { style: [styles.permissionWrap, normalized.uiMode === "fullscreen" ? styles.fullscreenRoot : styles.embeddedRoot] },
+      React.createElement(
+        TextComponent,
+        { style: styles.permissionText },
+        "No back camera available on this device."
+      )
+    );
+  }
+  if (!hasPermission) {
     return React.createElement(
       ViewComponent,
       { style: [styles.permissionWrap, normalized.uiMode === "fullscreen" ? styles.fullscreenRoot : styles.embeddedRoot] },
@@ -648,22 +668,20 @@ function CardScannerView({
   return React.createElement(
     ViewComponent,
     { style: normalized.uiMode === "fullscreen" ? styles.fullscreenRoot : styles.embeddedRoot },
-    React.createElement(CameraView, {
+    React.createElement(Camera, {
       ref: cameraRef,
       style: styles.camera,
-      facing: "back",
-      mode: "picture",
-      autofocus: "on",
-      animateShutter: false,
-      enableTorch: torchEnabled,
-      responsiveOrientationWhenOrientationLocked: true,
-      pictureSize: Platform2.OS === "ios" ? "High" : void 0,
-      onCameraReady: () => {
+      device,
+      isActive: true,
+      photo: true,
+      torch: torchEnabled ? "on" : "off",
+      photoQualityBalance: Platform2.OS === "ios" ? "quality" : void 0,
+      onInitialized: () => {
         cameraReadyRef.current = true;
         cameraReadyAtRef.current = Date.now();
         setCameraReady(true);
       },
-      onMountError: () => {
+      onError: () => {
         cameraReadyRef.current = false;
         cameraReadyAtRef.current = null;
         focusReadyRef.current = false;
