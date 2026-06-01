@@ -30,8 +30,17 @@ function resolveCameraModule(): {
   CameraView?: React.ComponentType<Record<string, unknown> & { ref?: React.Ref<CameraRefLike> }>;
   useCameraPermissions?: () => [PermissionState | null, () => Promise<unknown>];
 } {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('expo-camera');
+  // expo-camera is an OPTIONAL peer dependency. Hosts that ship a different
+  // camera stack (e.g. react-native-vision-camera) will not have it installed;
+  // returning an empty module lets the SDK load without crashing the bundler.
+  // The CardScannerView component then renders a placeholder until the host
+  // wires in its own camera adapter.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('expo' + '-camera');
+  } catch {
+    return {};
+  }
 }
 
 export function CardScannerView({

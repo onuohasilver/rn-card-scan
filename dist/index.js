@@ -468,7 +468,11 @@ function clamp(value) {
 // src/components/CardScannerView.tsx
 var FOCUS_SETTLE_MS = 900;
 function resolveCameraModule() {
-  return require("expo-camera");
+  try {
+    return require("expo-camera");
+  } catch {
+    return {};
+  }
 }
 function CardScannerView({
   options,
