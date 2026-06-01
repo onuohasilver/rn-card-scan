@@ -113,10 +113,14 @@ export function CardScannerView({
         isCapturingRef.current = true;
         try {
           await waitForCameraStability(cameraReadyRef, cameraReadyAtRef, focusReadyRef);
+          // vision-camera 4.6.x has a known bug where qualityPrioritization
+          // 'quality' + enableShutterSound:false causes the AVFoundation
+          // photo delegate to fire didFinishProcessingPhoto twice — the
+          // promise rejects once then crashes trying to reject again. Stick
+          // to 'balanced' and leave the shutter sound at its default.
           const photo = await cameraRef.current.takePhoto({
             flash: 'off',
-            enableShutterSound: false,
-            qualityPrioritization: 'quality',
+            qualityPrioritization: 'balanced',
           });
           return photoToFrame(photo);
         } finally {
@@ -136,11 +140,12 @@ export function CardScannerView({
 
             const photo = await cameraRef.current.takePhoto({
               flash: 'off',
-              enableShutterSound: false,
-              qualityPrioritization: 'quality',
+              qualityPrioritization: 'balanced',
             });
             frames.push(photoToFrame(photo));
-            await sleep(220);
+            // Longer gap between burst shots — back-to-back takePhoto calls
+            // on vision-camera 4.6.x can have overlapping delegate callbacks.
+            await sleep(450);
           }
         } finally {
           isCapturingRef.current = false;

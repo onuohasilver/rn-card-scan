@@ -67,8 +67,15 @@ interface CardScanOptions {
     livenessStrictness?: 'standard' | 'high';
     /** Automatically scan the back of the card for the CVV after the front scan succeeds. Default: true. */
     captureBackForCvv?: boolean;
-    /** How long (ms) to wait after showing the "flip your card" prompt before auto-capturing the back. Default: 2500. */
+    /** How long (ms) to wait after showing the "flip your card" prompt before auto-capturing the back. Default: 2500. Ignored when `waitForBackTrigger` is supplied. */
     flipPauseMs?: number;
+    /**
+     * Optional async hook that gates the back-of-card capture. When provided,
+     * the SDK awaits this Promise instead of running `flipPauseMs` on a timer
+     * — letting the host implement a "tap to capture the back" UX. Resolve
+     * when the user is ready; reject to skip the back capture entirely.
+     */
+    waitForBackTrigger?: () => Promise<void>;
     debugDiagnostics?: boolean;
     collectName?: boolean;
     collectExpiry?: boolean;

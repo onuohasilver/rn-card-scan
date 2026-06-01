@@ -149,7 +149,23 @@ function fuseCardCandidates(linesByFrame, positionedLinesByFrame) {
   }
   const bestPan = [...panScores.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
   const panSupport = bestPan ? panCandidatesByFrame.filter((framePans) => framePans.includes(bestPan)).length / frameCount : 0;
-  const expiryCandidates = linesByFrame.flatMap((lines) => extractExpiryCandidates(lines));
+  const rawExpiryCandidates = linesByFrame.flatMap((lines) => extractExpiryCandidates(lines));
+  const currentYear = (/* @__PURE__ */ new Date()).getFullYear();
+  const expiryCandidates = rawExpiryCandidates.filter((expiry) => {
+    const compact = expiry.replace(/\D/g, "");
+    if (bestPan && bestPan.includes(compact)) {
+      return false;
+    }
+    const [mm, yy] = expiry.split("/");
+    if (!mm || !yy || yy.length !== 2) {
+      return false;
+    }
+    const year = 2e3 + Number.parseInt(yy, 10);
+    if (year < currentYear - 2 || year > currentYear + 25) {
+      return false;
+    }
+    return true;
+  });
   const bestExpiry = pickMostFrequent(expiryCandidates);
   const expirySupport = bestExpiry ? expiryCandidates.filter((value) => value === bestExpiry).length / frameCount : 0;
   const nameCandidates = positionedLinesByFrame ? positionedLinesByFrame.flatMap((pLines) => extractNameCandidatesPositioned(pLines)) : linesByFrame.flatMap((lines) => extractNameCandidates(lines));
@@ -185,20 +201,151 @@ function fuseCardCandidates(linesByFrame, positionedLinesByFrame) {
   };
 }
 function extractPanCandidates(lines) {
-  const joined = lines.join(" ");
   const weightedCandidates = /* @__PURE__ */ new Map();
-  for (const match of joined.match(/[0-9OQDILZSBG\s-]{13,32}/gi) ?? []) {
-    addWeightedPanCandidates(weightedCandidates, match, 0.15);
-  }
   for (const line of lines) {
-    addWeightedPanCandidates(weightedCandidates, line, 0.9);
+    addWeightedPanCandidates(weightedCandidates, line, 1);
     for (const token of line.split(/\s+/)) {
       if (token.length >= 10) {
-        addWeightedPanCandidates(weightedCandidates, token, 0.3);
+        addWeightedPanCandidates(weightedCandidates, token, 0.7);
       }
     }
   }
-  return [...weightedCandidates.entries()].filter(([pan]) => pan.length === 15 || pan.length === 16).sort((a, b) => scorePanCandidate(b[0], b[1]) - scorePanCandidate(a[0], a[1])).map(([pan]) => pan);
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    addWeightedPanCandidates(weightedCandidates, `${lines[i]} ${lines[i + 1]}`, 0.55);
+  }
+  for (const assembled of assemblePanFromChunks(lines)) {
+    addWeightedPanCandidates(weightedCandidates, assembled, 0.8);
+  }
+  return [...weightedCandidates.entries()].filter(([pan]) => pan.length === 15 || pan.length === 16).filter(([pan]) => luhnCheck(pan) || inferCardBrand(pan) !== "other").sort((a, b) => scorePanCandidate(b[0], b[1]) - scorePanCandidate(a[0], a[1])).map(([pan]) => pan);
+}
+function assemblePanFromChunks(lines) {
+  const rawChunks = [];
+  const perLineChunks = [];
+  let nextSource = 0;
+  for (const line of lines) {
+    const normalized = normalizeDigitLikeString(line);
+    const lineChunks = [];
+    for (const match of normalized.matchAll(/\d{3,4}/g)) {
+      const text = match[0];
+      const source = nextSource++;
+      if (text.length === 4) {
+        const chunk = { value: text, sourceIndex: source, sourceWidth: 4 };
+        rawChunks.push(chunk);
+        lineChunks.push(chunk);
+      } else if (text.length === 3) {
+        lineChunks.push({ value: text, sourceIndex: source, sourceWidth: 3 });
+        for (let d = 0; d < 10; d += 1) {
+          rawChunks.push({ value: `${d}${text}`, sourceIndex: source, sourceWidth: 3 });
+        }
+      }
+    }
+    if (lineChunks.length > 0) {
+      perLineChunks.push(lineChunks);
+    }
+  }
+  if (rawChunks.length < 4) {
+    return [];
+  }
+  const results = /* @__PURE__ */ new Set();
+  for (const ordered of perLineChunks) {
+    if (ordered.length < 2) continue;
+    const anchorVariants = [];
+    const usedSources = new Set(ordered.map((c) => c.sourceIndex));
+    const buildVariants = (idx, accum) => {
+      if (idx === ordered.length) {
+        anchorVariants.push({ digits: accum, usedSources });
+        return;
+      }
+      const c = ordered[idx];
+      if (c.value.length === 4) {
+        buildVariants(idx + 1, accum + c.value);
+      } else {
+        for (let d = 0; d < 10; d += 1) {
+          buildVariants(idx + 1, accum + `${d}${c.value}`);
+        }
+      }
+    };
+    buildVariants(0, "");
+    const remainderChunks = rawChunks.filter(
+      (c) => !usedSources.has(c.sourceIndex) && c.sourceWidth === 4
+    );
+    for (const anchor of anchorVariants) {
+      const anchorLen = anchor.digits.length;
+      if (anchorLen === 16) {
+        tryAcceptPan(results, anchor.digits);
+        continue;
+      }
+      if (anchorLen === 12) {
+        for (const tail of remainderChunks) {
+          tryAcceptPan(results, anchor.digits + tail.value);
+        }
+        continue;
+      }
+      if (anchorLen === 11) {
+        for (const tail of remainderChunks) {
+          tryAcceptWithSingleInsertion(results, anchor.digits + tail.value);
+        }
+        continue;
+      }
+      if (anchorLen === 8) {
+        for (const a of remainderChunks) {
+          for (const b of remainderChunks) {
+            if (a.sourceIndex === b.sourceIndex) continue;
+            tryAcceptPan(results, anchor.digits + a.value + b.value);
+          }
+        }
+        continue;
+      }
+    }
+  }
+  if (results.size === 0) {
+    if (rawChunks.length > 60) {
+      return [];
+    }
+    const n = rawChunks.length;
+    for (let i = 0; i < n; i += 1) {
+      if (!isPanFirstGroup(rawChunks[i].value)) continue;
+      for (let j = 0; j < n; j += 1) {
+        if (rawChunks[j].sourceIndex === rawChunks[i].sourceIndex) continue;
+        for (let k = 0; k < n; k += 1) {
+          if (rawChunks[k].sourceIndex === rawChunks[i].sourceIndex || rawChunks[k].sourceIndex === rawChunks[j].sourceIndex) continue;
+          for (let l = 0; l < n; l += 1) {
+            if (rawChunks[l].sourceIndex === rawChunks[i].sourceIndex || rawChunks[l].sourceIndex === rawChunks[j].sourceIndex || rawChunks[l].sourceIndex === rawChunks[k].sourceIndex) continue;
+            tryAcceptPan(
+              results,
+              rawChunks[i].value + rawChunks[j].value + rawChunks[k].value + rawChunks[l].value
+            );
+          }
+        }
+      }
+    }
+  }
+  return [...results];
+}
+function tryAcceptPan(results, pan) {
+  if (pan.length !== 16) return;
+  if (!luhnCheck(pan)) return;
+  if (inferCardBrand(pan) === "other") return;
+  results.add(pan);
+}
+function tryAcceptWithSingleInsertion(results, partial) {
+  if (partial.length !== 15) return;
+  for (let pos = 0; pos <= 15; pos += 1) {
+    for (let d = 0; d < 10; d += 1) {
+      tryAcceptPan(results, partial.slice(0, pos) + d + partial.slice(pos));
+    }
+  }
+}
+function isPanFirstGroup(token) {
+  if (token.length !== 4) return false;
+  const first = token[0];
+  const second = token[1];
+  if (first === "4") return true;
+  if (first === "5" && "12345".includes(second)) return true;
+  if (first === "2" && "234567".includes(second)) return true;
+  if (first === "3" && (second === "4" || second === "7")) return true;
+  if (first === "6" && (second === "0" || second === "4" || second === "5")) return true;
+  return false;
 }
 function extractExpiryCandidates(lines) {
   const preprocessed = lines.map(
@@ -500,8 +647,7 @@ function CardScannerView({
           await waitForCameraStability(cameraReadyRef, cameraReadyAtRef, focusReadyRef);
           const photo = await cameraRef.current.takePhoto({
             flash: "off",
-            enableShutterSound: false,
-            qualityPrioritization: "quality"
+            qualityPrioritization: "balanced"
           });
           return photoToFrame(photo);
         } finally {
@@ -520,11 +666,10 @@ function CardScannerView({
             }
             const photo = await cameraRef.current.takePhoto({
               flash: "off",
-              enableShutterSound: false,
-              qualityPrioritization: "quality"
+              qualityPrioritization: "balanced"
             });
             frames.push(photoToFrame(photo));
-            await sleep(220);
+            await sleep(450);
           }
         } finally {
           isCapturingRef.current = false;
@@ -1143,7 +1288,9 @@ async function captureCardWithJsRuntime(options = {}) {
   const started = Date.now();
   options.onProgress?.("capture_started");
   const burstCount = Math.max(1, Math.min(8, options.burstCount ?? 5));
+  console.log("[card-scan] captureCard begin", { burstCount, captureMode: options.captureMode ?? "auto" });
   const photos = options.captureMode === "manual" || !adapter2.captureBurst ? [await adapter2.capturePhoto()] : await adapter2.captureBurst(burstCount);
+  console.log("[card-scan] captureCard photos taken", { count: photos.length, elapsedMs: Date.now() - started });
   if (photos.length === 0) {
     throw new Error("No frames captured. Hold card inside frame and try again.");
   }
@@ -1156,7 +1303,11 @@ async function captureCardWithJsRuntime(options = {}) {
   let nativeDiagCount = 0;
   for (const [index, photo] of photos.entries()) {
     options.onAutoCapture?.({ uri: photo.uri, index });
+    const frameStart = Date.now();
+    console.log("[card-scan] OCR frame begin", { index, uri: photo.uri });
     const frame = await recognizeCardFrame(photo.uri);
+    console.log("[card-scan] OCR frame done", { index, ms: Date.now() - frameStart, lineCount: frame.lines.length });
+    console.log("[card-scan] OCR frame lines", { index, lines: frame.lines });
     linesByFrame.push(frame.lines);
     if (frame.positionedLines) {
       positionedLinesByFrame.push(frame.positionedLines);
@@ -1174,6 +1325,13 @@ async function captureCardWithJsRuntime(options = {}) {
     linesByFrame,
     hasPositions ? positionedLinesByFrame : void 0
   );
+  console.log("[card-scan] fused candidates", {
+    pan: parsed.panCandidate,
+    expiry: parsed.expiryCandidate,
+    name: parsed.nameCandidate,
+    panConfidence: parsed.panConfidence,
+    expiryConfidence: parsed.expiryConfidence
+  });
   const frontBrand = parsed.panCandidate ? inferCardBrand(parsed.panCandidate) : "other";
   const shouldScanBack = (options.captureBackForCvv ?? true) && Boolean(parsed.panCandidate) && frontBrand !== "amex";
   let backCvvCandidate;
@@ -1183,17 +1341,28 @@ async function captureCardWithJsRuntime(options = {}) {
     await new Promise((resolve) => {
       setTimeout(resolve, flipPauseMs);
     });
-    options.onProgress?.("capture_back");
-    const backBurstCount = Math.max(1, Math.min(4, Math.ceil((options.burstCount ?? 5) / 2)));
-    const backPhotos = options.captureMode === "manual" || !adapter2.captureBurst ? [await adapter2.capturePhoto()] : await adapter2.captureBurst(backBurstCount);
-    const backLinesByFrame = [];
-    for (const [index, photo] of backPhotos.entries()) {
-      options.onAutoCapture?.({ uri: photo.uri, index, side: "back" });
-      const frame = await recognizeCardFrame(photo.uri);
-      backLinesByFrame.push(frame.lines);
+    try {
+      const waitForBackTrigger = options.waitForBackTrigger ?? (() => new Promise((resolve) => {
+        setTimeout(resolve, flipPauseMs);
+      }));
+      await waitForBackTrigger();
+      options.onProgress?.("capture_back");
+      const backPhoto = await adapter2.capturePhoto();
+      options.onAutoCapture?.({ uri: backPhoto.uri, index: 0, side: "back" });
+      try {
+        const frame = await recognizeCardFrame(backPhoto.uri);
+        const backParsed = fuseCardCandidates([frame.lines]);
+        backCvvCandidate = backParsed.cvvCandidate;
+      } catch (frameError) {
+        console.log("[card-scan] back OCR failed (CVV stays empty)", {
+          error: String(frameError)
+        });
+      }
+    } catch (backError) {
+      console.log("[card-scan] back capture failed (CVV stays empty)", {
+        error: String(backError)
+      });
     }
-    const backParsed = fuseCardCandidates(backLinesByFrame);
-    backCvvCandidate = backParsed.cvvCandidate;
     options.onProgress?.("back_complete", { cvvFound: Boolean(backCvvCandidate) });
   }
   const strictness = options.livenessStrictness ?? "standard";

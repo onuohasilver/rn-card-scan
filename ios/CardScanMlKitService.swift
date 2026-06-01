@@ -3,6 +3,21 @@ import Foundation
 import MLKitTextRecognition
 import MLKitVision
 import UIKit
+import os.log
+
+private let cardScanLog = OSLog(subsystem: "com.afriex.rn-card-scan", category: "ocr")
+
+private func footprintMB() -> Double {
+  var info = task_vm_info_data_t()
+  var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+  let kerr = withUnsafeMutablePointer(to: &info) {
+    $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+      task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+    }
+  }
+  guard kerr == KERN_SUCCESS else { return -1 }
+  return Double(info.phys_footprint) / 1024.0 / 1024.0
+}
 
 final class CardScanMlKitService {
   struct OcrImageResult {
@@ -38,6 +53,7 @@ final class CardScanMlKitService {
     uri: String,
     completion: @escaping (Result<OcrImageResult, Error>) -> Void
   ) {
+    os_log("recognizeTextFromImage begin mem=%.1fMB uri=%{public}@", log: cardScanLog, type: .info, footprintMB(), uri)
     do {
       let imageURL = try resolveImageURL(from: uri)
       guard let data = try? Data(contentsOf: imageURL),
@@ -50,13 +66,25 @@ final class CardScanMlKitService {
           userInfo: [NSLocalizedDescriptionKey: "Unable to load image for OCR from URI: \(uri)"]
         )
       }
+      os_log("recognizeTextFromImage loaded image %.0fx%.0f mem=%.1fMB", log: cardScanLog, type: .info, image.size.width, image.size.height, footprintMB())
 
-      let variants = buildOcrVariants(from: image)
+      // Pre-crop to the central card-frame region that matches the on-screen
+      // green dashed bounding box (~90% width × 50% height, centered). This
+      // removes background clutter (hand, keyboard, screen text behind the
+      // card) before MLKit sees the image so the PAN/expiry don't get drowned
+      // out by background OCR hits. Fallback to the full image if cropping
+      // fails for any reason.
+      let croppedForOcr = crop(image: image, relativeRect: CGRect(x: 0.05, y: 0.25, width: 0.90, height: 0.50)) ?? image
+      os_log("recognizeTextFromImage cropped to %.0fx%.0f mem=%.1fMB", log: cardScanLog, type: .info, croppedForOcr.size.width, croppedForOcr.size.height, footprintMB())
+
+      let variants = buildOcrVariants(from: croppedForOcr)
+      os_log("recognizeTextFromImage built %d variants mem=%.1fMB", log: cardScanLog, type: .info, variants.count, footprintMB())
       let metrics = computeImageMetrics(cgImage: cgImage)
       let positionBuffer = PositionBuffer()
       let imageHeight = Double(image.size.height)
 
       processVariants(variants, index: 0, lineScores: [:], positionBuffer: positionBuffer, imageHeight: imageHeight, firstError: nil) { result in
+        os_log("recognizeTextFromImage done mem=%.1fMB", log: cardScanLog, type: .info, footprintMB())
         switch result {
         case .success(let lines):
           completion(
@@ -76,6 +104,7 @@ final class CardScanMlKitService {
         }
       }
     } catch {
+      os_log("recognizeTextFromImage error: %{public}@", log: cardScanLog, type: .error, "\(error)")
       completion(.failure(error))
     }
   }
@@ -121,8 +150,12 @@ final class CardScanMlKitService {
     let variant = variants[index]
     let visionImage = VisionImage(image: variant.image)
     visionImage.orientation = .up
+    os_log("variant %d/%d %.0fx%.0f weight=%.2f", log: cardScanLog, type: .info, index + 1, variants.count, variant.image.size.width, variant.image.size.height, variant.weight)
 
     textRecognizer.process(visionImage) { [weak self] result, error in
+      let blockCount = result?.blocks.count ?? 0
+      let resultText = result?.text ?? ""
+      os_log("variant %d MLKit returned %d blocks, %d chars (err=%{public}@)", log: cardScanLog, type: .info, index + 1, blockCount, resultText.count, error.map { "\($0)" } ?? "nil")
       guard let self else {
         completion(
           .failure(
@@ -231,37 +264,12 @@ final class CardScanMlKitService {
   }
 
   private func buildOcrVariants(from image: UIImage) -> [OcrVariant] {
-    var variants: [OcrVariant] = [
-      OcrVariant(image: image, weight: 1.0)
-    ]
-
-    if let boosted = makeHighContrastVariant(from: image, contrast: 1.45, brightness: -0.02, sharpness: 0.85) {
-      variants.append(OcrVariant(image: boosted, weight: 1.08))
-    }
-
-    if let cardCrop = crop(image: image, relativeRect: CGRect(x: 0.08, y: 0.18, width: 0.84, height: 0.62)),
-       let cardBoost = makeHighContrastVariant(from: cardCrop, contrast: 1.55, brightness: -0.03, sharpness: 1.0) {
-      variants.append(OcrVariant(image: cardBoost, weight: 1.18))
-    }
-
-    if let panCrop = crop(image: image, relativeRect: CGRect(x: 0.08, y: 0.34, width: 0.84, height: 0.24)) {
-      variants.append(OcrVariant(image: panCrop, weight: 1.22))
-
-      if let panBoost = makeHighContrastVariant(from: panCrop, contrast: 1.75, brightness: -0.04, sharpness: 1.2) {
-        variants.append(OcrVariant(image: panBoost, weight: 1.38))
-      }
-
-      if let panShadow = makeShadowReliefVariant(from: panCrop) {
-        variants.append(OcrVariant(image: panShadow, weight: 1.34))
-      }
-    }
-
-    if let lowerCrop = crop(image: image, relativeRect: CGRect(x: 0.10, y: 0.54, width: 0.62, height: 0.18)),
-       let lowerBoost = makeShadowReliefVariant(from: lowerCrop) {
-      variants.append(OcrVariant(image: lowerBoost, weight: 1.12))
-    }
-
-    return variants
+    // Single-variant fast path: just OCR the normalized full image. The
+    // multi-variant crop heuristics assume the card fills the frame in a
+    // specific landscape orientation that doesn't match how vision-camera
+    // captures in portrait, and 8 variants × 3 burst frames was pushing the
+    // total OCR time past 45s.
+    return [OcrVariant(image: image, weight: 1.0)]
   }
 
   private func makeHighContrastVariant(

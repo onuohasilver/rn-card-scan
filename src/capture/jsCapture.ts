@@ -14,10 +14,12 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
   options.onProgress?.('capture_started');
 
   const burstCount = Math.max(1, Math.min(8, options.burstCount ?? 5));
+  console.log('[card-scan] captureCard begin', {burstCount, captureMode: options.captureMode ?? 'auto'});
   const photos =
     options.captureMode === 'manual' || !adapter.captureBurst
       ? [await adapter.capturePhoto()]
       : await adapter.captureBurst(burstCount);
+  console.log('[card-scan] captureCard photos taken', {count: photos.length, elapsedMs: Date.now() - started});
 
   if (photos.length === 0) {
     throw new Error('No frames captured. Hold card inside frame and try again.');
@@ -32,7 +34,13 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
   let nativeDiagCount = 0;
   for (const [index, photo] of photos.entries()) {
     options.onAutoCapture?.({ uri: photo.uri, index });
+    const frameStart = Date.now();
+    console.log('[card-scan] OCR frame begin', {index, uri: photo.uri});
     const frame = await recognizeCardFrame(photo.uri);
+    console.log('[card-scan] OCR frame done', {index, ms: Date.now() - frameStart, lineCount: frame.lines.length});
+    // Print every raw line so we can compare what MLKit read against the
+    // actual card. Useful for diagnosing PAN_LOW_CONFIDENCE / Luhn failures.
+    console.log('[card-scan] OCR frame lines', {index, lines: frame.lines});
     linesByFrame.push(frame.lines);
     if (frame.positionedLines) {
       positionedLinesByFrame.push(frame.positionedLines);
@@ -51,6 +59,13 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
     linesByFrame,
     hasPositions ? positionedLinesByFrame : undefined
   );
+  console.log('[card-scan] fused candidates', {
+    pan: parsed.panCandidate,
+    expiry: parsed.expiryCandidate,
+    name: parsed.nameCandidate,
+    panConfidence: parsed.panConfidence,
+    expiryConfidence: parsed.expiryConfidence,
+  });
 
   // ── Back-of-card CVV capture ──────────────────────────────────────────────
   // Amex prints the CID on the front; all other networks (Visa, Mastercard,
@@ -68,22 +83,42 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
     options.onProgress?.('flip_card', { pauseMs: flipPauseMs });
     await new Promise<void>((resolve) => { setTimeout(resolve, flipPauseMs); });
 
-    options.onProgress?.('capture_back');
-    const backBurstCount = Math.max(1, Math.min(4, Math.ceil((options.burstCount ?? 5) / 2)));
-    const backPhotos =
-      options.captureMode === 'manual' || !adapter.captureBurst
-        ? [await adapter.capturePhoto()]
-        : await adapter.captureBurst(backBurstCount);
+    // Back-of-card is entirely optional and best-effort. The CVV is a nice-
+    // to-have for autofill; ownership verification only needs PAN + expiry +
+    // name from the front. Wrap the whole block in try/catch so any failure
+    // (camera unavailable, MLKit empty, photo file unreadable, native error)
+    // falls through to a front-only result instead of aborting the scan.
+    try {
+      // Hand control of the flip-pause to the host. Default is the old 2.5s
+      // sleep; the host can supply a Promise that resolves on a user tap so
+      // there is no on-screen timer.
+      const waitForBackTrigger =
+        options.waitForBackTrigger ??
+        (() => new Promise<void>((resolve) => {
+          setTimeout(resolve, flipPauseMs);
+        }));
+      await waitForBackTrigger();
 
-    const backLinesByFrame: string[][] = [];
-    for (const [index, photo] of backPhotos.entries()) {
-      options.onAutoCapture?.({ uri: photo.uri, index, side: 'back' });
-      const frame = await recognizeCardFrame(photo.uri);
-      backLinesByFrame.push(frame.lines);
+      options.onProgress?.('capture_back');
+      // Single back frame is plenty for a CVV (3-4 digits) and keeps memory
+      // pressure low. Multi-frame back burst was over-eager.
+      const backPhoto = await adapter.capturePhoto();
+      options.onAutoCapture?.({ uri: backPhoto.uri, index: 0, side: 'back' });
+
+      try {
+        const frame = await recognizeCardFrame(backPhoto.uri);
+        const backParsed = fuseCardCandidates([frame.lines]);
+        backCvvCandidate = backParsed.cvvCandidate;
+      } catch (frameError) {
+        console.log('[card-scan] back OCR failed (CVV stays empty)', {
+          error: String(frameError),
+        });
+      }
+    } catch (backError) {
+      console.log('[card-scan] back capture failed (CVV stays empty)', {
+        error: String(backError),
+      });
     }
-
-    const backParsed = fuseCardCandidates(backLinesByFrame);
-    backCvvCandidate = backParsed.cvvCandidate;
     options.onProgress?.('back_complete', { cvvFound: Boolean(backCvvCandidate) });
   }
   // ─────────────────────────────────────────────────────────────────────────

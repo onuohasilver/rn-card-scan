@@ -102,7 +102,29 @@ export function fuseCardCandidates(
     ? panCandidatesByFrame.filter((framePans) => framePans.includes(bestPan)).length / frameCount
     : 0;
 
-  const expiryCandidates = linesByFrame.flatMap((lines) => extractExpiryCandidates(lines));
+  const rawExpiryCandidates = linesByFrame.flatMap((lines) => extractExpiryCandidates(lines));
+  // Filter out false positives:
+  //   1. A 4-digit PAN group (e.g. "1163") will satisfy the expiry regex
+  //      ("11" is a valid month, "63" two more digits) — drop candidates
+  //      whose compact form appears as a substring of the chosen PAN.
+  //   2. Years more than 25 years out are not real card expiries — usually
+  //      that's the back half of a PAN group being misread as a year.
+  const currentYear = new Date().getFullYear();
+  const expiryCandidates = rawExpiryCandidates.filter((expiry) => {
+    const compact = expiry.replace(/\D/g, '');
+    if (bestPan && bestPan.includes(compact)) {
+      return false;
+    }
+    const [mm, yy] = expiry.split('/');
+    if (!mm || !yy || yy.length !== 2) {
+      return false;
+    }
+    const year = 2000 + Number.parseInt(yy, 10);
+    if (year < currentYear - 2 || year > currentYear + 25) {
+      return false;
+    }
+    return true;
+  });
   const bestExpiry = pickMostFrequent(expiryCandidates);
   const expirySupport = bestExpiry
     ? expiryCandidates.filter((value) => value === bestExpiry).length / frameCount
@@ -157,27 +179,269 @@ export function fuseCardCandidates(
 }
 
 function extractPanCandidates(lines: string[]): string[] {
-  const joined = lines.join(' ');
   const weightedCandidates = new Map<string, number>();
 
-  for (const match of joined.match(/[0-9OQDILZSBG\s-]{13,32}/gi) ?? []) {
-    addWeightedPanCandidates(weightedCandidates, match, 0.15);
-  }
-
+  // Pass 1: per-line. Strongest signal when a line is already PAN-shaped.
   for (const line of lines) {
-    addWeightedPanCandidates(weightedCandidates, line, 0.9);
+    addWeightedPanCandidates(weightedCandidates, line, 1.0);
 
     for (const token of line.split(/\s+/)) {
       if (token.length >= 10) {
-        addWeightedPanCandidates(weightedCandidates, token, 0.3);
+        addWeightedPanCandidates(weightedCandidates, token, 0.7);
       }
     }
   }
 
+  // Pass 2: adjacent pairs. Bridges the case where MLKit splits the PAN
+  // across two lines (8-digit halves like "5399 8344" / "1163 2003").
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    addWeightedPanCandidates(weightedCandidates, `${lines[i]} ${lines[i + 1]}`, 0.55);
+  }
+
+  // Pass 3: chunk-assembly. The embossed-card OCR commonly returns the four
+  // 4-digit groups as SEPARATE lines in scrambled order (e.g. "2003", "1163",
+  // "5399", "344"), and sometimes one group is truncated to 3 digits when
+  // the bbox detector clips a character. Permute the available 4-digit
+  // chunks, constrain the leading group to a known card-brand prefix, and
+  // let Luhn pick the correct assembly.
+  for (const assembled of assemblePanFromChunks(lines)) {
+    // Weight 0.8 — high enough that a Luhn+brand-valid assembled candidate
+    // beats any per-line junk that happens to be 16 digits, but lower than
+    // a pristine per-line PAN match (weight 1.0) so we don't override a
+    // clear single-line read.
+    addWeightedPanCandidates(weightedCandidates, assembled, 0.8);
+  }
+
   return [...weightedCandidates.entries()]
     .filter(([pan]) => pan.length === 15 || pan.length === 16)
+    .filter(([pan]) => luhnCheck(pan) || inferCardBrand(pan) !== 'other')
     .sort((a, b) => scorePanCandidate(b[0], b[1]) - scorePanCandidate(a[0], a[1]))
     .map(([pan]) => pan);
+}
+
+/**
+ * Return 16-digit Luhn-valid PAN candidates assembled from the 3-4 digit
+ * chunks present in the OCR lines.
+ *
+ * Strategy:
+ *   1. Anchored assembly — if any single OCR line contains multiple chunks
+ *      (e.g. "5399 344 1163"), those preserve the true left-to-right order.
+ *      Concatenate that ordered run and append remaining chunks, then test.
+ *   2. Single-digit insertion — if the assembled run is exactly 15 digits
+ *      (one digit clipped by the embossed-character bbox detector), try
+ *      every digit 0-9 at every position 0-15 and Luhn-filter.
+ *   3. Permutation fallback — when no multi-chunk line exists, permute the
+ *      available 4-digit chunks. Each ORIGINAL source chunk is used at
+ *      most once (preventing the bug where two different expansions of the
+ *      same 3-digit chunk both end up in one PAN).
+ */
+interface ExpandedChunk {
+  readonly value: string;
+  readonly sourceIndex: number;
+  /** Width of the underlying OCR token before any 3→4 digit expansion. */
+  readonly sourceWidth: 3 | 4;
+}
+
+function assemblePanFromChunks(lines: string[]): string[] {
+  // ── Phase 1: collect raw chunks per-line, with source identity ────────────
+  // sourceIndex is the index of the underlying 3-4 digit token in OCR scan
+  // order. Multiple expansions of the same source share an index so we can
+  // forbid using the same source twice in one PAN.
+  const rawChunks: ExpandedChunk[] = [];
+  // perLineChunks preserves the in-line ordering of chunks for Phase 2 anchors.
+  const perLineChunks: ExpandedChunk[][] = [];
+
+  let nextSource = 0;
+  for (const line of lines) {
+    const normalized = normalizeDigitLikeString(line);
+    const lineChunks: ExpandedChunk[] = [];
+    for (const match of normalized.matchAll(/\d{3,4}/g)) {
+      const text = match[0];
+      const source = nextSource++;
+      if (text.length === 4) {
+        const chunk: ExpandedChunk = { value: text, sourceIndex: source, sourceWidth: 4 };
+        rawChunks.push(chunk);
+        lineChunks.push(chunk);
+      } else if (text.length === 3) {
+        // Single canonical entry in perLineChunks for the anchor pass; the
+        // 10 expansions go into rawChunks only.
+        lineChunks.push({ value: text, sourceIndex: source, sourceWidth: 3 });
+        for (let d = 0; d < 10; d += 1) {
+          rawChunks.push({ value: `${d}${text}`, sourceIndex: source, sourceWidth: 3 });
+        }
+      }
+    }
+    if (lineChunks.length > 0) {
+      perLineChunks.push(lineChunks);
+    }
+  }
+
+  if (rawChunks.length < 4) {
+    return [];
+  }
+
+  // ── Phase 2: anchored assembly via multi-chunk lines ──────────────────────
+  // When MLKit returns multiple chunks on one line, those chunks were on the
+  // same horizontal row of the card (and thus already in left-to-right card
+  // order). Use them as a fixed prefix and append other chunks as suffix.
+  const results = new Set<string>();
+  for (const ordered of perLineChunks) {
+    if (ordered.length < 2) continue;
+
+    // Build the anchor string from the in-line order. For 3-digit anchors we
+    // try each leading digit 0-9 to recover the clipped char.
+    const anchorVariants: { digits: string; usedSources: Set<number> }[] = [];
+    const usedSources = new Set<number>(ordered.map((c) => c.sourceIndex));
+    const buildVariants = (idx: number, accum: string): void => {
+      if (idx === ordered.length) {
+        anchorVariants.push({ digits: accum, usedSources });
+        return;
+      }
+      const c = ordered[idx];
+      if (c.value.length === 4) {
+        buildVariants(idx + 1, accum + c.value);
+      } else {
+        for (let d = 0; d < 10; d += 1) {
+          buildVariants(idx + 1, accum + `${d}${c.value}`);
+        }
+      }
+    };
+    buildVariants(0, '');
+
+    // Remaining chunks for the tail. Restrict to chunks whose underlying
+    // OCR token was already 4 digits — using expansions of 3-digit fragments
+    // as the tail produces phantom PANs (e.g. the line "53993441163" gets
+    // greedy-split into ["5399", "3441", "163"]; the "163" fragment then
+    // expands to "8163" and gets glued onto the end of a valid-shape PAN that
+    // happens to pass Luhn). A 3-digit tail almost always means we're reusing
+    // a clipped fragment of another group rather than reading a new group.
+    const remainderChunks = rawChunks.filter(
+      (c) => !usedSources.has(c.sourceIndex) && c.sourceWidth === 4,
+    );
+
+    for (const anchor of anchorVariants) {
+      const anchorLen = anchor.digits.length;
+
+      // 16-digit anchor — try as-is.
+      if (anchorLen === 16) {
+        tryAcceptPan(results, anchor.digits);
+        continue;
+      }
+
+      // 12-digit anchor + 4-digit remainder = 16 digits.
+      if (anchorLen === 12) {
+        for (const tail of remainderChunks) {
+          tryAcceptPan(results, anchor.digits + tail.value);
+        }
+        continue;
+      }
+
+      // 11-digit anchor (3 chunks, one 3-digit clipped) + 4-digit remainder
+      // = 15 digits → single-digit insertion search for the missing char.
+      if (anchorLen === 11) {
+        for (const tail of remainderChunks) {
+          tryAcceptWithSingleInsertion(results, anchor.digits + tail.value);
+        }
+        continue;
+      }
+
+      // 8-digit anchor (2 4-digit chunks) + two 4-digit remainders, in order.
+      if (anchorLen === 8) {
+        for (const a of remainderChunks) {
+          for (const b of remainderChunks) {
+            if (a.sourceIndex === b.sourceIndex) continue;
+            tryAcceptPan(results, anchor.digits + a.value + b.value);
+          }
+        }
+        continue;
+      }
+    }
+  }
+
+  // ── Phase 3: permutation fallback ─────────────────────────────────────────
+  // No anchored answer? Permute all 4-digit candidates, constraining the
+  // leading group to a known card-brand prefix and each source chunk to be
+  // used at most once.
+  if (results.size === 0) {
+    if (rawChunks.length > 60) {
+      // Defensive cap: this should never fire for real cards (≤6 chunks even
+      // after 10× expansion of a single 3-digit chunk).
+      return [];
+    }
+    const n = rawChunks.length;
+    for (let i = 0; i < n; i += 1) {
+      if (!isPanFirstGroup(rawChunks[i].value)) continue;
+      for (let j = 0; j < n; j += 1) {
+        if (rawChunks[j].sourceIndex === rawChunks[i].sourceIndex) continue;
+        for (let k = 0; k < n; k += 1) {
+          if (
+            rawChunks[k].sourceIndex === rawChunks[i].sourceIndex ||
+            rawChunks[k].sourceIndex === rawChunks[j].sourceIndex
+          ) continue;
+          for (let l = 0; l < n; l += 1) {
+            if (
+              rawChunks[l].sourceIndex === rawChunks[i].sourceIndex ||
+              rawChunks[l].sourceIndex === rawChunks[j].sourceIndex ||
+              rawChunks[l].sourceIndex === rawChunks[k].sourceIndex
+            ) continue;
+            tryAcceptPan(
+              results,
+              rawChunks[i].value + rawChunks[j].value + rawChunks[k].value + rawChunks[l].value,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return [...results];
+}
+
+/** Add `pan` to results if it's 16 digits, Luhn-valid, and a known brand. */
+function tryAcceptPan(results: Set<string>, pan: string): void {
+  if (pan.length !== 16) return;
+  if (!luhnCheck(pan)) return;
+  if (inferCardBrand(pan) === 'other') return;
+  results.add(pan);
+}
+
+/**
+ * `partial` is 15 digits with one character clipped somewhere. Try inserting
+ * every digit 0-9 at every position; accept Luhn-valid results.
+ */
+function tryAcceptWithSingleInsertion(results: Set<string>, partial: string): void {
+  if (partial.length !== 15) return;
+  for (let pos = 0; pos <= 15; pos += 1) {
+    for (let d = 0; d < 10; d += 1) {
+      tryAcceptPan(results, partial.slice(0, pos) + d + partial.slice(pos));
+    }
+  }
+}
+
+/**
+ * True when the 4-digit token could be the leading group of a PAN from a
+ * known major network. Used to constrain the chunk-assembly permutation
+ * search to viable starting digits.
+ */
+function isPanFirstGroup(token: string): boolean {
+  if (token.length !== 4) return false;
+  const first = token[0];
+  const second = token[1];
+
+  // Visa — starts with 4
+  if (first === '4') return true;
+
+  // Mastercard — 51-55 (legacy) or 2221-2720 (post-2017 BIN range)
+  if (first === '5' && '12345'.includes(second)) return true;
+  if (first === '2' && '234567'.includes(second)) return true;
+
+  // American Express — 34 or 37
+  if (first === '3' && (second === '4' || second === '7')) return true;
+
+  // Discover — 60, 64, 65 (covers 6011 and 644-649 / 65 ranges)
+  if (first === '6' && (second === '0' || second === '4' || second === '5')) return true;
+
+  return false;
 }
 
 function extractExpiryCandidates(lines: string[]): string[] {
