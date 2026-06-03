@@ -40,4 +40,13 @@ repositories {
 
 dependencies {
   implementation 'com.facebook.react:react-android'
+  // Unbundled MLKit text recognition — works on devices without Google Play
+  // Services (matters for LATAM / Africa). The 'play-services-mlkit-*'
+  // variant would also work but requires Play Services availability.
+  implementation 'com.google.mlkit:text-recognition:16.0.1'
+  // EXIF orientation handling when loading the captured JPEG.
+  implementation 'androidx.exifinterface:exifinterface:1.3.7'
+  // Kotlin coroutines for the MLKit Task → suspend bridge.
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3'
 }
