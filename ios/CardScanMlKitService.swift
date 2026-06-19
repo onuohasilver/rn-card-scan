@@ -56,9 +56,16 @@ final class CardScanMlKitService {
     os_log("recognizeTextFromImage begin mem=%.1fMB uri=%{public}@", log: cardScanLog, type: .info, footprintMB(), uri)
     do {
       let imageURL = try resolveImageURL(from: uri)
+      // Downscale immediately after decode. The capture is ~10MP (~40MB
+      // decoded); the crop, CIFilter variants, and MLKit each allocate copies,
+      // and several frames in a burst stacked past iOS's memory limit
+      // ("Unable to load image for OCR" / jetsam). Capping the longest side
+      // keeps the PAN legible while cutting per-frame memory ~5x, which is what
+      // makes a multi-frame burst (needed for reliable PAN fusion) viable.
       guard let data = try? Data(contentsOf: imageURL),
             let rawImage = UIImage(data: data),
-            let image = normalizeOrientation(rawImage),
+            let oriented = normalizeOrientation(rawImage),
+            let image = downscaleForOcr(oriented, maxLongestSide: 2000),
             let cgImage = image.cgImage else {
         throw NSError(
           domain: "CardScanMlKitService",
@@ -355,6 +362,31 @@ final class CardScanMlKitService {
     let renderer = UIGraphicsImageRenderer(size: image.size)
     return renderer.image { _ in
       image.draw(in: CGRect(origin: .zero, size: image.size))
+    }
+  }
+
+  /// Resize so the longest side is at most `maxLongestSide`, preserving aspect
+  /// ratio. Returns the image unchanged when it is already within bounds.
+  /// Renders at scale 1 (no Retina multiplier) so the pixel dimensions — and
+  /// therefore the decoded byte size — actually shrink.
+  private func downscaleForOcr(_ image: UIImage, maxLongestSide: CGFloat) -> UIImage? {
+    let longest = max(image.size.width, image.size.height)
+    guard longest > maxLongestSide else {
+      return image
+    }
+
+    let scale = maxLongestSide / longest
+    let newSize = CGSize(
+      width: (image.size.width * scale).rounded(),
+      height: (image.size.height * scale).rounded()
+    )
+
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+    return renderer.image { _ in
+      image.draw(in: CGRect(origin: .zero, size: newSize))
     }
   }
 
