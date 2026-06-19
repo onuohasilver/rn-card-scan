@@ -14,12 +14,10 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
   options.onProgress?.('capture_started');
 
   const burstCount = Math.max(1, Math.min(8, options.burstCount ?? 5));
-  console.log('[card-scan] captureCard begin', {burstCount, captureMode: options.captureMode ?? 'auto'});
   const photos =
     options.captureMode === 'manual' || !adapter.captureBurst
       ? [await adapter.capturePhoto()]
       : await adapter.captureBurst(burstCount);
-  console.log('[card-scan] captureCard photos taken', {count: photos.length, elapsedMs: Date.now() - started});
 
   if (photos.length === 0) {
     throw new Error('No frames captured. Hold card inside frame and try again.');
@@ -34,13 +32,7 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
   let nativeDiagCount = 0;
   for (const [index, photo] of photos.entries()) {
     options.onAutoCapture?.({ uri: photo.uri, index });
-    const frameStart = Date.now();
-    console.log('[card-scan] OCR frame begin', {index, uri: photo.uri});
     const frame = await recognizeCardFrame(photo.uri);
-    console.log('[card-scan] OCR frame done', {index, ms: Date.now() - frameStart, lineCount: frame.lines.length});
-    // Print every raw line so we can compare what MLKit read against the
-    // actual card. Useful for diagnosing PAN_LOW_CONFIDENCE / Luhn failures.
-    console.log('[card-scan] OCR frame lines', {index, lines: frame.lines});
     linesByFrame.push(frame.lines);
     if (frame.positionedLines) {
       positionedLinesByFrame.push(frame.positionedLines);
@@ -59,13 +51,6 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
     linesByFrame,
     hasPositions ? positionedLinesByFrame : undefined
   );
-  console.log('[card-scan] fused candidates', {
-    pan: parsed.panCandidate,
-    expiry: parsed.expiryCandidate,
-    name: parsed.nameCandidate,
-    panConfidence: parsed.panConfidence,
-    expiryConfidence: parsed.expiryConfidence,
-  });
 
   // ── Back-of-card CVV capture ──────────────────────────────────────────────
   // Amex prints the CID on the front; all other networks (Visa, Mastercard,
@@ -109,15 +94,11 @@ export async function captureCardWithJsRuntime(options: CardScanOptions = {}): P
         const frame = await recognizeCardFrame(backPhoto.uri);
         const backParsed = fuseCardCandidates([frame.lines]);
         backCvvCandidate = backParsed.cvvCandidate;
-      } catch (frameError) {
-        console.log('[card-scan] back OCR failed (CVV stays empty)', {
-          error: String(frameError),
-        });
+      } catch {
+        // Back OCR is best-effort; CVV stays empty on failure.
       }
-    } catch (backError) {
-      console.log('[card-scan] back capture failed (CVV stays empty)', {
-        error: String(backError),
-      });
+    } catch {
+      // Back capture is best-effort; CVV stays empty on failure.
     }
     options.onProgress?.('back_complete', { cvvFound: Boolean(backCvvCandidate) });
   }
