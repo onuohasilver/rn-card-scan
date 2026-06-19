@@ -128,6 +128,7 @@ export interface NormalizedCardScanOptions {
   showCancelControl: boolean;
   showHintText: boolean;
   debugMode: boolean;
+  waitForBackTrigger?: CardScanOptions['waitForBackTrigger'];
   onProgress?: CardScanOptions['onProgress'];
   onAutoCapture?: CardScanOptions['onAutoCapture'];
   onResult?: CardScanOptions['onResult'];

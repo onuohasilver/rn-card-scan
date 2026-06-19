@@ -22,6 +22,14 @@ export function normalizeOptions(options: CardScanOptions = {}): NormalizedCardS
     showCancelControl: options.showCancelControl ?? true,
     showHintText: options.showHintText ?? true,
     debugMode: options.debugMode ?? false,
+    // Preserve the host-driven back-capture gate. captureCard() runs options
+    // through normalizeOptions() before handing them to the JS runtime, so a
+    // field that is dropped here never reaches captureCardWithJsRuntime. Without
+    // this passthrough the back-of-card (CVV) frame auto-fires on the
+    // flipPauseMs timer — often mid-flip while the lens is still refocusing —
+    // which can crash the camera session. Forwarding it lets the back capture
+    // be user-triggered (and shot on a stable camera) exactly like the front.
+    waitForBackTrigger: options.waitForBackTrigger,
     onProgress: options.onProgress,
     onAutoCapture: options.onAutoCapture,
     onResult: options.onResult,
